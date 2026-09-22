@@ -1,11 +1,22 @@
 import { createContext, useContext, useEffect, useState } from "react";
-import type { Session, User } from "@supabase/supabase-js";
-import { supabase } from "@/lib/supabase";
+import {
+  createUserWithEmailAndPassword,
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut as firebaseSignOut,
+  updateProfile as updateFirebaseProfile,
+} from "firebase/auth";
+import { doc, getDoc, setDoc } from "firebase/firestore";
+
+import { auth, db } from "@/lib/firebase";
+import type { User } from "firebase/auth";
 import type { Profile } from "@/types";
-import { getProfile } from "@/lib/api";
 
 interface AuthContextValue {
-  session: Session | null;
+  session: User | null;
   user: User | null;
   profile: Profile | null;
   loading: boolean;
@@ -20,75 +31,111 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [session, setSession] = useState<Session | null>(null);
+  const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setLoading(false);
-    });
+  const loadProfile = async (firebaseUser: User) => {
+    const profileRef = doc(db, "users", firebaseUser.uid);
+    const profileSnap = await getDoc(profileRef);
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => {
-      (async () => {
-        setSession(sess);
-        if (sess?.user) {
-          const p = await getProfile();
-          setProfile(p as Profile | null);
+    if (profileSnap.exists()) {
+      setProfile(profileSnap.data() as Profile);
+    } else {
+      const newProfile = {
+        id: firebaseUser.uid,
+        full_name: firebaseUser.displayName || "",
+        avatar_url: firebaseUser.photoURL || null,
+        email: firebaseUser.email || "",
+        created_at: new Date().toISOString(),
+      };
+
+      await setDoc(profileRef, newProfile);
+      setProfile(newProfile as Profile);
+    }
+  };
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      try {
+        setUser(firebaseUser);
+
+        if (firebaseUser) {
+          await loadProfile(firebaseUser);
         } else {
           setProfile(null);
         }
-      })();
+      } catch (error) {
+        console.error("Failed to load profile:", error);
+        setProfile(null);
+      } finally {
+        setLoading(false);
+      }
     });
 
-    return () => sub.subscription.unsubscribe();
+    return () => unsubscribe();
   }, []);
 
-  const signUp = async (email: string, password: string, fullName: string) => {
-    const { error } = await supabase.auth.signUp({
+  const signUp = async (
+    email: string,
+    password: string,
+    fullName: string
+  ) => {
+    const result = await createUserWithEmailAndPassword(
+      auth,
       email,
-      password,
-      options: { data: { full_name: fullName } },
+      password
+    );
+
+    await updateFirebaseProfile(result.user, {
+      displayName: fullName,
     });
-    if (error) throw error;
+
+    const newProfile = {
+      id: result.user.uid,
+      full_name: fullName,
+      avatar_url: null,
+      email,
+      created_at: new Date().toISOString(),
+    };
+
+    await setDoc(doc(db, "users", result.user.uid), newProfile);
+
+    setUser(result.user);
+    setProfile(newProfile as Profile);
   };
 
   const signIn = async (email: string, password: string) => {
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) throw error;
+    await signInWithEmailAndPassword(auth, email, password);
   };
 
   const signInWithGoogle = async () => {
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: window.location.origin + "/dashboard" },
-    });
-    if (error) throw error;
+    const provider = new GoogleAuthProvider();
+    const result = await signInWithPopup(auth, provider);
+
+    await loadProfile(result.user);
   };
 
   const resetPassword = async (email: string) => {
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: window.location.origin + "/login",
-    });
-    if (error) throw error;
+    await sendPasswordResetEmail(auth, email);
   };
 
   const signOut = async () => {
-    await supabase.auth.signOut();
+    await firebaseSignOut(auth);
+    setUser(null);
     setProfile(null);
   };
 
   const refreshProfile = async () => {
-    const p = await getProfile();
-    setProfile(p as Profile | null);
+    if (!user) return;
+    await loadProfile(user);
   };
 
   return (
     <AuthContext.Provider
       value={{
-        session,
-        user: session?.user ?? null,
+        session: user,
+        user,
         profile,
         loading,
         signUp,
@@ -106,6 +153,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 export function useAuth() {
   const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+
+  if (!ctx) {
+    throw new Error("useAuth must be used within AuthProvider");
+  }
+
   return ctx;
 }
